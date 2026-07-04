@@ -4,6 +4,9 @@
 .agents/
 .temp_ag_kit/
 
+# Custom Exclusions
+backend/tests/
+
 # Python compiled files
 __pycache__/
 *.py[cod]
