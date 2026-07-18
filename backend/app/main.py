@@ -9,10 +9,12 @@ from app.api.endpoints import router as api_router
 from app.api.auth import router as auth_router
 from app.api.settings import router as settings_router
 from app.analytics.routes.analytics import router as analytics_router
+from app.api.agents import router as agents_router
 from app.database.database import db_manager
 from app.utils.config import settings
 from app.utils.logger import setup_logger
 from app.services.ocr_service import ocr_service
+from app.services.agents.scheduler import agent_scheduler
 
 # Initialize Logging configuration
 setup_logger()
@@ -40,6 +42,13 @@ async def lifespan(app: FastAPI):
             logger.info("Successfully seeded default categories: Paint, Building Materials, Hardware, Electrical")
     except Exception as e:
         logger.error(f"Database connection or seeding failed at startup: {e}")
+
+    # 1.1 Start and sync the Agent Scheduler
+    try:
+        agent_scheduler.start()
+        await agent_scheduler.sync_all_jobs()
+    except Exception as e:
+        logger.error(f"Failed to start or sync Agent Scheduler: {e}")
         
     # 2. Warm up OCR engine asynchronously in a background thread to prevent startup blocks
     try:
@@ -51,6 +60,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown actions
     logger.info("Shutting down AI-powered Purchase Intelligence System Backend...")
+    # Shutdown the Agent Scheduler
+    try:
+        agent_scheduler.shutdown()
+    except Exception as e:
+        logger.warning(f"Error shutting down Agent Scheduler: {e}")
     db_manager.disconnect()
 
 # Create FastAPI instance
@@ -92,6 +106,7 @@ app.include_router(auth_router)
 app.include_router(settings_router)
 app.include_router(api_router, tags=["Bill Ingestion"])
 app.include_router(analytics_router)
+app.include_router(agents_router)
 
 @app.get("/", tags=["Health"])
 def health_check():

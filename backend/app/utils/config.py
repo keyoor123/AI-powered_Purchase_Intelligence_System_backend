@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     OPENROUTER_MODEL: str = "google/gemini-2.5-flash:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
+    # SMTP Configuration for Agent Reports
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = "no-reply@procurement-intelligence.com"
+
     # Pydantic Settings Configuration
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR.parent / ".env"),
