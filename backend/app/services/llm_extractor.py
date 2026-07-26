@@ -3,6 +3,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from typing import Union, List, Any, Dict
 from pathlib import Path
 from openai import AsyncOpenAI
 from app.utils.config import settings
@@ -14,7 +15,7 @@ class BaseLLMExtractor(ABC):
     """Abstract base class for LLM extraction layer to support provider independence."""
     
     @abstractmethod
-    async def extract_bill_data(self, ocr_text: str, image_path: str) -> dict:
+    async def extract_bill_data(self, ocr_text: str, image_path: Union[str, List[str]]) -> dict:
         """
         Extracts structured bill details using Vision/LLM.
         
@@ -171,7 +172,7 @@ class OpenRouterExtractor(BaseLLMExtractor):
 
         return data
 
-    async def extract_bill_data(self, ocr_text: str, image_path: str) -> dict:
+    async def extract_bill_data(self, ocr_text: str, image_path: Union[str, List[str]]) -> dict:
         """Passes image (base64) and OCR text to OpenRouter to parse invoice data."""
         logger.info(f"Initiating OpenRouter Vision LLM extraction using model: {self.model}")
         
@@ -179,10 +180,34 @@ class OpenRouterExtractor(BaseLLMExtractor):
             raise ValueError("OPENROUTER_API_KEY is not configured. Extraction aborted.")
 
         try:
-            base64_image_url = self._encode_image_to_base64(image_path)
-            
             system_prompt = get_bill_extraction_system_prompt()
             user_prompt = get_bill_extraction_user_prompt(ocr_text)
+
+            user_content = [
+                {
+                    "type": "text",
+                    "text": user_prompt
+                }
+            ]
+
+            # Append single or multiple images
+            if isinstance(image_path, list):
+                for p in image_path:
+                    base64_image_url = self._encode_image_to_base64(p)
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": base64_image_url
+                        }
+                    })
+            else:
+                base64_image_url = self._encode_image_to_base64(image_path)
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": base64_image_url
+                    }
+                })
 
             # Build messages for Vision LLM
             messages = [
@@ -192,18 +217,7 @@ class OpenRouterExtractor(BaseLLMExtractor):
                 },
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": user_prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": base64_image_url
-                            }
-                        }
-                    ]
+                    "content": user_content
                 }
             ]
 

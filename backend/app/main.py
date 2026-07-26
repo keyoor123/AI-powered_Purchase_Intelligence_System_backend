@@ -9,7 +9,7 @@ from app.api.endpoints import router as api_router
 from app.api.auth import router as auth_router
 from app.api.settings import router as settings_router
 from app.analytics.routes.analytics import router as analytics_router
-from app.api.agents import router as agents_router
+from app.api.agents import router as agents_router, yearly_router as yearly_agents_router
 from app.database.database import db_manager
 from app.utils.config import settings
 from app.utils.logger import setup_logger
@@ -107,6 +107,8 @@ app.include_router(settings_router)
 app.include_router(api_router, tags=["Bill Ingestion"])
 app.include_router(analytics_router)
 app.include_router(agents_router)
+app.include_router(yearly_agents_router)
+
 
 @app.get("/", tags=["Health"])
 def health_check():

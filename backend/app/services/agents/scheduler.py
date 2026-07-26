@@ -20,6 +20,18 @@ async def run_monthly_report_job(user_id: str):
     except Exception as e:
         logger.error(f"Error in scheduled Monthly Report job for user_id {user_id}: {e}", exc_info=True)
 
+
+async def run_yearly_report_job(user_id: str):
+    """Importable task wrapper for APScheduler serialization."""
+    from app.services.agents.yearly_report_agent import yearly_report_agent
+    logger.info(f"Executing scheduled Yearly Report Agent job for user_id: {user_id}")
+    try:
+        success = await yearly_report_agent.run(user_id)
+        logger.info(f"Yearly Report Agent execution result for user_id {user_id}: {success}")
+    except Exception as e:
+        logger.error(f"Error in scheduled Yearly Report job for user_id {user_id}: {e}", exc_info=True)
+
+
 class AgentScheduler:
     def __init__(self):
         self.scheduler: AsyncIOScheduler = None
@@ -84,27 +96,39 @@ class AgentScheduler:
             return
 
         value = doc["value"]
-        day_of_month = value.get("schedule_config", {}).get("day_of_month", 2)
         
-        # Set up a Cron trigger to run on the selected day of every month at 9:00 AM server time
-        trigger = CronTrigger(day=day_of_month, hour=9, minute=0)
+        if agent_type == "monthly_report":
+            day_of_month = value.get("schedule_config", {}).get("day_of_month", 2)
+            trigger = CronTrigger(day=day_of_month, hour=9, minute=0)
+            target_func = run_monthly_report_job
+            logger_msg = f"to run on day {day_of_month} of the month"
+        elif agent_type == "yearly_report":
+            month = value.get("schedule_config", {}).get("month", 1)
+            day = value.get("schedule_config", {}).get("day", 15)
+            trigger = CronTrigger(month=month, day=day, hour=9, minute=0)
+            target_func = run_yearly_report_job
+            logger_msg = f"to run on month {month}, day {day} of the year"
+        else:
+            logger.error(f"Unknown agent type for scheduling: {agent_type}")
+            return
 
         # Upsert APScheduler Job
         job = self.scheduler.get_job(job_id)
         if job:
             # Modify/reschedule if already exists
             self.scheduler.reschedule_job(job_id, trigger=trigger)
-            logger.info(f"Rescheduled job '{job_id}' to run on day {day_of_month} of the month.")
+            logger.info(f"Rescheduled job '{job_id}' {logger_msg}.")
         else:
             # Create new job
             self.scheduler.add_job(
-                run_monthly_report_job,
+                target_func,
                 trigger=trigger,
                 args=[user_id],
                 id=job_id,
                 replace_existing=True
             )
-            logger.info(f"Added new job '{job_id}' to run on day {day_of_month} of the month.")
+            logger.info(f"Added new job '{job_id}' {logger_msg}.")
+
 
     async def sync_all_jobs(self):
         """Syncs all active agent configurations from MongoDB at startup."""

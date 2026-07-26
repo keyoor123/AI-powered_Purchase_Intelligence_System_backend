@@ -40,6 +40,7 @@ class BillDataSchema(BaseModel):
     total: float = Field(..., description="Grand total of the bill", ge=0)
     category: Optional[str] = Field(None, description="Category for the entire bill and all its products")
     status: Optional[str] = Field(None, description="Verification status of the bill (e.g. pending, verified)")
+    bill_image: Optional[str] = Field(None, description="Filename or paths of original bill image(s)")
 
     @field_validator("dealer_name", "invoice_no", "date")
     @classmethod

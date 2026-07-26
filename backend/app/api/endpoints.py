@@ -34,6 +34,129 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def process_multiple_files(files: List[UploadFile]) -> dict:
+    """
+    Helper to process a list of uploaded invoice files (pages of the same bill)
+    asynchronously through the pipeline, OCR them, combine results, and run Vision LLM.
+    """
+    t_start = time.time()
+    
+    if not files:
+        return {
+            "success": False,
+            "detail": "No files provided."
+        }
+
+    # Validate file extensions
+    for file in files:
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext not in [".jpg", ".jpeg", ".png", ".pdf", ".webp"]:
+            logger.error(f"Unsupported file type uploaded: {file_ext}")
+            return {
+                "filename": file.filename,
+                "success": False,
+                "detail": f"Unsupported file format '{file_ext}'. Please upload JPG, JPEG, PNG, WEBP, or PDF."
+            }
+
+    # Use a single temporary directory for all pages
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        
+        preprocessed_paths = []
+        all_ocr_texts = []
+        
+        # Process each file page-by-page
+        for idx, file in enumerate(files):
+            file_ext = os.path.splitext(file.filename)[1].lower()
+            original_file_path = temp_dir_path / f"page_{idx}{file_ext}"
+            
+            # 1. Save uploaded file page
+            try:
+                def write_file():
+                    with open(original_file_path, "wb") as buffer:
+                        shutil.copyfileobj(file.file, buffer)
+                await asyncio.to_thread(write_file)
+            except Exception as e:
+                logger.error(f"Failed to save uploaded file {file.filename}: {e}")
+                return {
+                    "filename": file.filename,
+                    "success": False,
+                    "detail": f"Failed to save uploaded file: {str(e)}"
+                }
+
+            # 2. Preprocess page
+            try:
+                preprocessed_path = await asyncio.to_thread(
+                    image_preprocessor.preprocess,
+                    str(original_file_path),
+                    str(temp_dir_path)
+                )
+                preprocessed_paths.append(preprocessed_path)
+            except Exception as e:
+                logger.error(f"Preprocessing failed for {file.filename}: {e}")
+                return {
+                    "filename": file.filename,
+                    "success": False,
+                    "detail": f"Preprocessing failed on page {idx + 1}: {str(e)}"
+                }
+
+            # 3. Run OCR extraction on page
+            try:
+                ocr_text = await ocr_service.extract_text(preprocessed_path)
+                all_ocr_texts.append(f"--- PAGE {idx + 1} START ---\n{ocr_text}\n--- PAGE {idx + 1} END ---")
+            except Exception as e:
+                logger.error(f"OCR extraction failed for {file.filename}: {e}")
+                return {
+                    "filename": file.filename,
+                    "success": False,
+                    "detail": f"OCR text extraction failed on page {idx + 1}: {str(e)}"
+                }
+
+        # Combine all OCR texts
+        combined_ocr_text = "\n\n".join(all_ocr_texts)
+
+        # 4. Run Vision LLM Extraction on the combined text & images list
+        t_llm_start = time.time()
+        try:
+            extracted_data = await llm_extractor.extract_bill_data(
+                ocr_text=combined_ocr_text,
+                image_path=preprocessed_paths
+            )
+            t_llm = time.time() - t_llm_start
+            logger.info(f"Vision LLM extraction of {len(files)} pages completed in {t_llm:.4f}s")
+        except Exception as e:
+            logger.error(f"Vision LLM extraction failed for multi-page upload: {e}")
+            return {
+                "filename": files[0].filename,
+                "success": False,
+                "detail": f"Vision LLM data extraction failed: {str(e)}"
+            }
+
+    # Add bill image metadata (use primary filename or joined)
+    extracted_data["bill_image"] = ", ".join(f.filename for f in files)
+
+    # 5. Validate output using Pydantic
+    t_val_start = time.time()
+    try:
+        validated_bill = BillDataSchema(**extracted_data)
+        t_val = time.time() - t_val_start
+        t_total = time.time() - t_start
+        logger.info(f"Structured JSON validated successfully in {t_val:.4f}s. Total pipeline time: {t_total:.4f}s")
+        return {
+            "filename": files[0].filename,
+            "success": True,
+            "bill_data": validated_bill.model_dump()
+        }
+    except Exception as e:
+        logger.error(f"Pydantic validation failed: {e}")
+        return {
+            "filename": files[0].filename,
+            "success": False,
+            "validation_errors": str(e),
+            "bill_data": extracted_data
+        }
+
+
 async def process_single_file(file: UploadFile) -> dict:
     """
     Helper to process a single uploaded invoice file asynchronously through the pipeline.
@@ -146,14 +269,14 @@ async def process_single_file(file: UploadFile) -> dict:
 
 
 @router.post("/upload", status_code=status.HTTP_200_OK)
-async def upload_bill(file: UploadFile = File(...), user_id: str = Depends(get_current_user_id)):
+async def upload_bill(files: List[UploadFile] = File(..., alias="file"), user_id: str = Depends(get_current_user_id)):
     """
-    Ingests a paper bill image or PDF, runs the preprocessing & OCR pipeline,
-    extracts structured data using the LLM Vision model, and validates it.
-    Uses temporary files which are deleted immediately after processing.
+    Ingests one or more paper bill images or PDFs (pages of the same bill),
+    runs the preprocessing & OCR pipeline, extracts structured data using the LLM Vision model,
+    and validates it. Uses temporary files which are deleted immediately after processing.
     """
-    logger.info(f"Received file upload request from user {user_id} for file: {file.filename}")
-    result = await process_single_file(file)
+    logger.info(f"Received file upload request from user {user_id} for {len(files)} files.")
+    result = await process_multiple_files(files)
     
     if not result["success"]:
         if "validation_errors" in result:
@@ -165,14 +288,14 @@ async def upload_bill(file: UploadFile = File(...), user_id: str = Depends(get_c
         
         # Determine status code based on error type
         status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
-        if "Vision LLM" in result["detail"]:
+        if result.get("detail") and "Vision LLM" in result["detail"]:
             status_code = status.HTTP_502_BAD_GATEWAY
-        elif "Unsupported file format" in result["detail"]:
+        elif result.get("detail") and "Unsupported file format" in result["detail"]:
             status_code = status.HTTP_400_BAD_REQUEST
             
         raise HTTPException(
             status_code=status_code,
-            detail=result["detail"]
+            detail=result.get("detail", "Processing failed")
         )
 
     return {
