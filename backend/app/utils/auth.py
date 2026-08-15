@@ -2,7 +2,7 @@ import jwt
 import bcrypt
 from datetime import datetime, timedelta
 from typing import Optional, Union
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.utils.config import settings
 
@@ -47,7 +47,10 @@ def decode_access_token(token: str) -> Optional[dict]:
     except (jwt.PyJWTError, ValueError):
         return None
 
-async def get_current_user_id(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)) -> str:
+async def get_current_user_id(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme)
+) -> str:
     """
     FastAPI dependency that extracts and validates the authenticated user_id from the request.
     Raises 401 Unauthorized if the token is missing, expired, or invalid.
@@ -58,10 +61,13 @@ async def get_current_user_id(credentials: Optional[HTTPAuthorizationCredentials
         headers={"WWW-Authenticate": "Bearer"},
     )
     
-    if not credentials:
-        raise credentials_exception
+    token = request.cookies.get("access_token")
+    if not token:
+        if credentials:
+            token = credentials.credentials
+        else:
+            raise credentials_exception
 
-    token = credentials.credentials
     payload = decode_access_token(token)
     if payload is None:
         raise credentials_exception

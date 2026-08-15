@@ -36,3 +36,20 @@ class TokenResponseSchema(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: dict = Field(..., description="Basic details of the logged in user")
+
+class VerifyEmailSchema(BaseModel):
+    email: EmailStr = Field(..., description="User's email address")
+    code: str = Field(..., description="6-digit verification OTP code", min_length=6, max_length=6)
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower()
+
+class ResendVerificationSchema(BaseModel):
+    email: EmailStr = Field(..., description="User's email address")
+
+    @field_validator("email")
+    @classmethod
+    def clean_email(cls, v: str) -> str:
+        return v.strip().lower()

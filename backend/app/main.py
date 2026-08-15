@@ -40,8 +40,17 @@ async def lifespan(app: FastAPI):
             ]
             await categories_collection.insert_many(default_categories)
             logger.info("Successfully seeded default categories: Paint, Building Materials, Hardware, Electrical")
+            
+        # Run one-time migration for legacy users missing 'is_verified' field
+        users_collection = db_manager.get_users_collection()
+        migration_res = await users_collection.update_many(
+            {"is_verified": {"$exists": False}},
+            {"$set": {"is_verified": False}}
+        )
+        if migration_res.modified_count > 0:
+            logger.info(f"Database migration: Initialized 'is_verified: False' for {migration_res.modified_count} legacy user(s).")
     except Exception as e:
-        logger.error(f"Database connection or seeding failed at startup: {e}")
+        logger.error(f"Database connection, seeding, or migration failed at startup: {e}")
 
     # 1.1 Start and sync the Agent Scheduler
     try:

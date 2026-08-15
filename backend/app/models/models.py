@@ -17,6 +17,9 @@ class UserDocument(BaseModel):
     email: str
     hashed_password: str
     display_name: str
+    is_verified: bool = False
+    verification_code: Optional[str] = None
+    verification_code_expires_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     model_config = {

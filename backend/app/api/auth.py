@@ -1,7 +1,8 @@
 import logging
-from datetime import datetime
+import random
+from datetime import datetime, timedelta
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from bson import ObjectId
@@ -13,7 +14,9 @@ from app.schemas.auth import (
     UserLoginSchema,
     ForgotPasswordSchema,
     ResetPasswordSchema,
-    TokenResponseSchema
+    TokenResponseSchema,
+    VerifyEmailSchema,
+    ResendVerificationSchema
 )
 from app.utils.auth import (
     get_password_hash,
@@ -21,17 +24,19 @@ from app.utils.auth import (
     create_access_token,
     decode_access_token
 )
+from app.utils.config import settings
+from app.utils.mailer import send_otp_email
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["User Authentication"])
 
 
-@router.post("/signup", response_model=TokenResponseSchema, status_code=status.HTTP_201_CREATED)
-async def signup(signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
+@router.post("/signup", status_code=status.HTTP_201_CREATED)
+async def signup(response: Response, signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
-    Registers a new user, hashes their password, seeds initial default categories,
-    and returns a JWT access token.
+    Registers a new user as unverified, generates a 6-digit verification OTP,
+    seeds default categories, and returns verification prompt details.
     """
     email = signup_payload.email.strip().lower()
     logger.info(f"Received signup request for email: {email}")
@@ -47,12 +52,19 @@ async def signup(signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = De
                 detail="This email address is already registered. Please sign in instead."
             )
 
+        # Generate 6-digit verification code
+        verification_code = f"{random.randint(100000, 999999)}"
+        verification_expires_at = datetime.utcnow() + timedelta(minutes=15)
+
         # Hash the password and save
         hashed_password = get_password_hash(signup_payload.password)
         new_user = UserDocument(
             email=email,
             hashed_password=hashed_password,
-            display_name=signup_payload.display_name.strip()
+            display_name=signup_payload.display_name.strip(),
+            is_verified=False,
+            verification_code=verification_code,
+            verification_code_expires_at=verification_expires_at
         )
         
         res = await users_collection.insert_one(new_user.model_dump(by_alias=True, exclude={"id"}))
@@ -70,18 +82,30 @@ async def signup(signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = De
         await categories_collection.insert_many([c.model_dump(by_alias=True, exclude={"id"}) for c in default_categories])
         logger.info(f"Seeded 4 default categories for user: {user_id}")
 
-        # Generate JWT access token
-        access_token = create_access_token(data={"sub": user_id})
-        
-        return TokenResponseSchema(
-            access_token=access_token,
-            token_type="bearer",
-            user={
-                "id": user_id,
-                "email": email,
-                "display_name": signup_payload.display_name
-            }
-        )
+        # Log OTP code to backend terminal/logs for backup/debugging
+        logger.info("\n==================================================")
+        logger.info(f"EMAIL VERIFICATION OTP FOR {email}: {verification_code}")
+        logger.info("==================================================\n")
+
+        # Send real OTP email
+        try:
+            await send_otp_email(email, verification_code)
+        except Exception as e:
+            logger.error(f"Failed to send email verification: {e}")
+            # Roll back registration changes
+            await users_collection.delete_one({"_id": ObjectId(user_id)})
+            await categories_collection.delete_many({"user_id": user_id})
+            logger.info(f"Rolled back registration for user {email} due to SMTP delivery failure.")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to send verification email. Please try again after some time."
+            )
+
+        return {
+            "success": True,
+            "message": "Registration successful. A 6-digit OTP code has been sent to your email address.",
+            "email": email
+        }
 
     except HTTPException:
         raise
@@ -94,9 +118,10 @@ async def signup(signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = De
 
 
 @router.post("/login", response_model=TokenResponseSchema)
-async def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncIOMotorDatabase = Depends(get_database)):
+async def login_form(response: Response, form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Standard OAuth2 Form-based login endpoint. Used by Swagger UI authorize lock.
+    Sets access token cookie and returns token in response body.
     """
     email = form_data.username.strip().lower()
     logger.info(f"OAuth2 form login attempt for: {email}")
@@ -111,8 +136,48 @@ async def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Async
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if user.get("is_verified") is False:
+        # Automatically generate and send verification code during unverified login
+        verification_code = f"{random.randint(100000, 999999)}"
+        verification_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        
+        await users_collection.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "verification_code": verification_code,
+                    "verification_code_expires_at": verification_expires_at
+                }
+            }
+        )
+        
+        logger.info(f"Unverified OAuth2 login: Generated new OTP for {email}: {verification_code}")
+        
+        try:
+            await send_otp_email(email, verification_code)
+        except Exception as e:
+            logger.error(f"Failed to send email verification during login: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Email address not verified. Failed to send verification email. Please try again after some time."
+            )
+            
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email address not verified. A verification code has been sent to your email."
+        )
+
     user_id = str(user["_id"])
     access_token = create_access_token(data={"sub": user_id})
+
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=settings.APP_ENV != "development",
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60
+    )
 
     return TokenResponseSchema(
         access_token=access_token,
@@ -126,9 +191,10 @@ async def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Async
 
 
 @router.post("/login/json", response_model=TokenResponseSchema)
-async def login_json(login_payload: UserLoginSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
+async def login_json(response: Response, login_payload: UserLoginSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     JSON-based login endpoint. Ideal for REST clients and frontend integrations.
+    Sets access token in HttpOnly cookie and clears it from response body.
     """
     email = login_payload.email.strip().lower()
     logger.info(f"JSON login attempt for: {email}")
@@ -143,11 +209,51 @@ async def login_json(login_payload: UserLoginSchema, db: AsyncIOMotorDatabase = 
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if user.get("is_verified") is False:
+        # Automatically generate and send verification code during unverified login
+        verification_code = f"{random.randint(100000, 999999)}"
+        verification_expires_at = datetime.utcnow() + timedelta(minutes=15)
+        
+        await users_collection.update_one(
+            {"_id": user["_id"]},
+            {
+                "$set": {
+                    "verification_code": verification_code,
+                    "verification_code_expires_at": verification_expires_at
+                }
+            }
+        )
+        
+        logger.info(f"Unverified JSON login: Generated new OTP for {email}: {verification_code}")
+        
+        try:
+            await send_otp_email(email, verification_code)
+        except Exception as e:
+            logger.error(f"Failed to send email verification during login: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Email address not verified. Failed to send verification email. Please try again after some time."
+            )
+            
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email address not verified. A verification code has been sent to your email."
+        )
+
     user_id = str(user["_id"])
     access_token = create_access_token(data={"sub": user_id})
 
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=settings.APP_ENV != "development",
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60
+    )
+
     return TokenResponseSchema(
-        access_token=access_token,
+        access_token="",
         token_type="bearer",
         user={
             "id": user_id,
@@ -155,6 +261,167 @@ async def login_json(login_payload: UserLoginSchema, db: AsyncIOMotorDatabase = 
             "display_name": user["display_name"]
         }
     )
+
+
+@router.post("/verify-email", response_model=TokenResponseSchema)
+async def verify_email(response: Response, verify_payload: VerifyEmailSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
+    """
+    Validates a 6-digit OTP code for a user's email.
+    If valid, sets user status to verified, issues access token cookie, and returns user data.
+    """
+    email = verify_payload.email.strip().lower()
+    code = verify_payload.code.strip()
+    logger.info(f"Email verification attempt for: {email}")
+
+    users_collection = db_manager.get_users_collection()
+    user = await users_collection.find_one({"email": email})
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found."
+        )
+
+    # Check if already verified
+    if user.get("is_verified") is True:
+        logger.info(f"User {email} is already verified.")
+        # Generate token and login anyway as convenience
+        user_id = str(user["_id"])
+        access_token = create_access_token(data={"sub": user_id})
+        response.set_cookie(
+            key="access_token",
+            value=access_token,
+            httponly=True,
+            secure=settings.APP_ENV != "development",
+            samesite="lax",
+            max_age=7 * 24 * 60 * 60
+        )
+        return TokenResponseSchema(
+            access_token="",
+            token_type="bearer",
+            user={
+                "id": user_id,
+                "email": user["email"],
+                "display_name": user["display_name"]
+            }
+        )
+
+    # Validate code
+    stored_code = user.get("verification_code")
+    expires_at = user.get("verification_code_expires_at")
+    
+    if not stored_code or stored_code != code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification code."
+        )
+
+    if expires_at and expires_at < datetime.utcnow():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired. Please request a new one."
+        )
+
+    # Set as verified and clear code
+    user_id = str(user["_id"])
+    await users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {
+            "$set": {"is_verified": True},
+            "$unset": {"verification_code": "", "verification_code_expires_at": ""}
+        }
+    )
+    logger.info(f"User {email} successfully verified.")
+
+    # Issue access token
+    access_token = create_access_token(data={"sub": user_id})
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=settings.APP_ENV != "development",
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60
+    )
+
+    return TokenResponseSchema(
+        access_token="",
+        token_type="bearer",
+        user={
+            "id": user_id,
+            "email": user["email"],
+            "display_name": user["display_name"]
+        }
+    )
+
+
+@router.post("/resend-verification")
+async def resend_verification(payload: ResendVerificationSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
+    """
+    Generates and logs a new 6-digit OTP verification code for an unverified user.
+    """
+    email = payload.email.strip().lower()
+    logger.info(f"Resend verification request for: {email}")
+
+    users_collection = db_manager.get_users_collection()
+    user = await users_collection.find_one({"email": email})
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User account not found."
+        )
+
+    if user.get("is_verified") is True:
+        return {"success": True, "message": "Account is already verified."}
+
+    # Generate new verification code
+    verification_code = f"{random.randint(100000, 999999)}"
+    verification_expires_at = datetime.utcnow() + timedelta(minutes=15)
+
+    await users_collection.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "verification_code": verification_code,
+                "verification_code_expires_at": verification_expires_at
+            }
+        }
+    )
+
+    # Log OTP code to backend terminal/logs for backup/debugging
+    logger.info("\n==================================================")
+    logger.info(f"NEW EMAIL VERIFICATION OTP FOR {email}: {verification_code}")
+    logger.info("==================================================\n")
+
+    # Send real OTP email
+    try:
+        await send_otp_email(email, verification_code)
+    except Exception as e:
+        logger.error(f"Failed to send email verification: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to send verification email. Please try again after some time."
+        )
+
+    return {
+        "success": True,
+        "message": "A new verification OTP code has been sent to your email address."
+    }
+
+
+@router.post("/logout")
+async def logout(response: Response):
+    """
+    Clears the access_token HttpOnly cookie.
+    """
+    response.delete_cookie(
+        key="access_token",
+        httponly=True,
+        secure=settings.APP_ENV != "development",
+        samesite="lax"
+    )
+    return {"message": "Logged out successfully"}
 
 
 @router.post("/forgot-password")
