@@ -20,6 +20,9 @@ class UserDocument(BaseModel):
     is_verified: bool = False
     verification_code: Optional[str] = None
     verification_code_expires_at: Optional[datetime] = None
+    failed_login_attempts: int = 0
+    lockout_until: Optional[datetime] = None
+    failed_otp_attempts: int = 0
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
     model_config = {

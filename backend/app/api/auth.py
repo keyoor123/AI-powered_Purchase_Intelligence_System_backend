@@ -26,13 +26,14 @@ from app.utils.auth import (
 )
 from app.utils.config import settings
 from app.utils.mailer import send_otp_email
+from app.utils.security_limiter import verify_ip_rate_limit
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["User Authentication"])
 
 
-@router.post("/signup", status_code=status.HTTP_201_CREATED)
+@router.post("/signup", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_ip_rate_limit)])
 async def signup(response: Response, signup_payload: UserSignupSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Registers a new user as unverified, generates a 6-digit verification OTP,
@@ -117,7 +118,39 @@ async def signup(response: Response, signup_payload: UserSignupSchema, db: Async
         )
 
 
-@router.post("/login", response_model=TokenResponseSchema)
+async def record_failed_login_attempt(user_id: ObjectId, current_failed_attempts: int, users_collection) -> int:
+    new_attempts = current_failed_attempts + 1
+    update_data = {"failed_login_attempts": new_attempts}
+    if new_attempts >= 5:
+        update_data["lockout_until"] = datetime.utcnow() + timedelta(minutes=15)
+        update_data["failed_login_attempts"] = 5
+        new_attempts = 5
+    
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$set": update_data}
+    )
+    return new_attempts
+
+async def reset_login_attempts(user_id: ObjectId, users_collection):
+    await users_collection.update_one(
+        {"_id": user_id},
+        {"$set": {"failed_login_attempts": 0, "lockout_until": None}}
+    )
+
+def check_account_lockout(user):
+    if user.get("lockout_until"):
+        lockout_until = user["lockout_until"]
+        if lockout_until.tzinfo is not None:
+            lockout_until = lockout_until.replace(tzinfo=None)
+        if datetime.utcnow() < lockout_until:
+            time_left = int((lockout_until - datetime.utcnow()).total_seconds() / 60) + 1
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This account is temporarily locked due to too many failed attempts. Try again after {time_left} minutes."
+            )
+
+@router.post("/login", response_model=TokenResponseSchema, dependencies=[Depends(verify_ip_rate_limit)])
 async def login_form(response: Response, form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Standard OAuth2 Form-based login endpoint. Used by Swagger UI authorize lock.
@@ -129,12 +162,24 @@ async def login_form(response: Response, form_data: OAuth2PasswordRequestForm = 
     users_collection = db_manager.get_users_collection()
     user = await users_collection.find_one({"email": email})
     
+    if user:
+        check_account_lockout(user)
+    
     if not user or not verify_password(form_data.password, user["hashed_password"]):
+        if user:
+            attempts = await record_failed_login_attempt(user["_id"], user.get("failed_login_attempts", 0), users_collection)
+            if attempts >= 5:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Incorrect email or password. This account is now locked for 15 minutes."
+                )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    await reset_login_attempts(user["_id"], users_collection)
 
     if user.get("is_verified") is False:
         # Automatically generate and send verification code during unverified login
@@ -190,7 +235,7 @@ async def login_form(response: Response, form_data: OAuth2PasswordRequestForm = 
     )
 
 
-@router.post("/login/json", response_model=TokenResponseSchema)
+@router.post("/login/json", response_model=TokenResponseSchema, dependencies=[Depends(verify_ip_rate_limit)])
 async def login_json(response: Response, login_payload: UserLoginSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     JSON-based login endpoint. Ideal for REST clients and frontend integrations.
@@ -202,12 +247,24 @@ async def login_json(response: Response, login_payload: UserLoginSchema, db: Asy
     users_collection = db_manager.get_users_collection()
     user = await users_collection.find_one({"email": email})
     
+    if user:
+        check_account_lockout(user)
+    
     if not user or not verify_password(login_payload.password, user["hashed_password"]):
+        if user:
+            attempts = await record_failed_login_attempt(user["_id"], user.get("failed_login_attempts", 0), users_collection)
+            if attempts >= 5:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Incorrect email or password. This account is now locked for 15 minutes."
+                )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    await reset_login_attempts(user["_id"], users_collection)
 
     if user.get("is_verified") is False:
         # Automatically generate and send verification code during unverified login
@@ -263,7 +320,7 @@ async def login_json(response: Response, login_payload: UserLoginSchema, db: Asy
     )
 
 
-@router.post("/verify-email", response_model=TokenResponseSchema)
+@router.post("/verify-email", response_model=TokenResponseSchema, dependencies=[Depends(verify_ip_rate_limit)])
 async def verify_email(response: Response, verify_payload: VerifyEmailSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Validates a 6-digit OTP code for a user's email.
@@ -311,10 +368,29 @@ async def verify_email(response: Response, verify_payload: VerifyEmailSchema, db
     expires_at = user.get("verification_code_expires_at")
     
     if not stored_code or stored_code != code:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid verification code."
-        )
+        failed_attempts = user.get("failed_otp_attempts", 0) + 1
+        if failed_attempts >= 5:
+            # Invalidate the OTP
+            await users_collection.update_one(
+                {"_id": user["_id"]},
+                {
+                    "$set": {"failed_otp_attempts": 0},
+                    "$unset": {"verification_code": "", "verification_code_expires_at": ""}
+                }
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Too many incorrect attempts. This OTP has been invalidated. Please request a new verification code."
+            )
+        else:
+            await users_collection.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"failed_otp_attempts": failed_attempts}}
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid verification code. Remaining attempts: {5 - failed_attempts}."
+            )
 
     if expires_at and expires_at < datetime.utcnow():
         raise HTTPException(
@@ -327,7 +403,7 @@ async def verify_email(response: Response, verify_payload: VerifyEmailSchema, db
     await users_collection.update_one(
         {"_id": ObjectId(user_id)},
         {
-            "$set": {"is_verified": True},
+            "$set": {"is_verified": True, "failed_otp_attempts": 0},
             "$unset": {"verification_code": "", "verification_code_expires_at": ""}
         }
     )
@@ -355,7 +431,7 @@ async def verify_email(response: Response, verify_payload: VerifyEmailSchema, db
     )
 
 
-@router.post("/resend-verification")
+@router.post("/resend-verification", dependencies=[Depends(verify_ip_rate_limit)])
 async def resend_verification(payload: ResendVerificationSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Generates and logs a new 6-digit OTP verification code for an unverified user.
@@ -424,7 +500,7 @@ async def logout(response: Response):
     return {"message": "Logged out successfully"}
 
 
-@router.post("/forgot-password")
+@router.post("/forgot-password", dependencies=[Depends(verify_ip_rate_limit)])
 async def forgot_password(forgot_payload: ForgotPasswordSchema, db: AsyncIOMotorDatabase = Depends(get_database)):
     """
     Generates a password reset token and simulates sending a reset link to the terminal.
