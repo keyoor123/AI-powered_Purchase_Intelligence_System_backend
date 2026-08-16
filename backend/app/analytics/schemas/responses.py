@@ -184,7 +184,7 @@ class AIContextResponse(BaseModel):
     context_data: Dict[str, Any] = Field(..., description="Structured JSON payload prepared for AI agent ingestion")
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., max_length=1000, description="The user query text")
 
 class ChatResponse(BaseModel):
     response: str
